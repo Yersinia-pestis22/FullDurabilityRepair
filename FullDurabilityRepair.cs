@@ -16,8 +16,11 @@ namespace Oxide.Plugins
         private const string permVip = "fulldurabilityrepair.vip";
         private const string permNoRestriction = "fulldurabilityrepair.norestriction";
 
+        private const string DataFileName = "FullDurabilityRepair_Data";
+
         private PluginConfig config;
         private Dictionary<string, PlayerRepairData> playerData = new Dictionary<string, PlayerRepairData>();
+        private Dictionary<string, PlayerRepairData> legacyHashedData = new Dictionary<string, PlayerRepairData>();
 
         private object resetTimer;
         private object saveTimer;
@@ -52,6 +55,14 @@ namespace Oxide.Plugins
             public long LastResetTicks { get; set; } = DateTime.UtcNow.Ticks;
             public int DailyCount { get; set; } = 0;
             public long LastRepairTicks { get; set; } = 0;
+        }
+
+        private class StoredData
+        {
+            public bool Anonymized { get; set; }
+            public Dictionary<string, PlayerRepairData> Records { get; set; } = new Dictionary<string, PlayerRepairData>();
+            public Dictionary<string, string> HashLookup { get; set; } = new Dictionary<string, string>();
+            public Dictionary<string, PlayerRepairData> LegacyHashed { get; set; } = new Dictionary<string, PlayerRepairData>();
         }
 
         protected override void LoadConfig()
@@ -113,13 +124,14 @@ namespace Oxide.Plugins
                 PrintError($"Error destruyendo timers en Unload: {ex}");
             }
 
-            SavePlayerData();
+            SavePlayerData(true);
         }
 
         void OnNewSave(string filename)
         {
             PrintWarning(lang.GetMessage("WipeDetected", this));
             playerData.Clear();
+            legacyHashedData.Clear();
             MarkDirtyAndScheduleSave();
         }
 
@@ -159,13 +171,10 @@ namespace Oxide.Plugins
                 int cooldown = isVip ? config.VipCooldownSeconds : config.CooldownSeconds;
                 int dailyLimit = isVip ? config.VipDailyLimit : config.DailyLimit;
 
-                string key = player.UserIDString;
-
-                if (!playerData.TryGetValue(key, out var data))
-                {
-                    data = new PlayerRepairData { LastResetTicks = DateTime.UtcNow.Ticks, DailyCount = 0, LastRepairTicks = 0 };
-                    playerData[key] = data;
-                }
+                bool created;
+                bool migrated;
+                var data = GetOrCreatePlayerData(player.UserIDString, out created, out migrated);
+                bool migrateOnly = created || migrated;
 
                 if (config.EnableDailyReset && config.ResetIntervalSeconds > 0)
                 {
@@ -186,6 +195,8 @@ namespace Oxide.Plugins
                         double remaining = cooldown - timePassed;
                         string timeFormatted = FormatSecondsReadable((int)Math.Ceiling(remaining));
                         player.ChatMessage(lang.GetMessage("CooldownMsg", this, player.UserIDString).Replace("{time}", timeFormatted));
+                        if (migrateOnly)
+                            MarkDirtyAndScheduleSave();
                         return false;
                     }
                 }
@@ -193,6 +204,8 @@ namespace Oxide.Plugins
                 if (dailyLimit > 0 && data.DailyCount >= dailyLimit)
                 {
                     player.ChatMessage(lang.GetMessage("LimitReachedMsg", this, player.UserIDString));
+                    if (migrateOnly)
+                        MarkDirtyAndScheduleSave();
                     return false;
                 }
 
@@ -350,8 +363,12 @@ namespace Oxide.Plugins
         [ChatCommand("fdrinfo")]
         private void CmdInfo(BasePlayer player, string command, string[] args)
         {
-            string key = player.UserIDString;
-            if (!playerData.TryGetValue(key, out var data))
+            bool migrated;
+            var data = FindOrMigratePlayerData(player.UserIDString, out migrated);
+            if (migrated)
+                MarkDirtyAndScheduleSave();
+
+            if (data == null)
             {
                 player.ChatMessage(lang.GetMessage("NoRepairsToday", this, player.UserIDString));
                 return;
@@ -380,7 +397,16 @@ namespace Oxide.Plugins
 
             foreach (var key in playerData.Keys.ToList())
             {
-                playerData[key].DailyCount = 0;
+                var entry = playerData[key];
+                entry.DailyCount = 0;
+                entry.LastResetTicks = DateTime.UtcNow.Ticks;
+            }
+
+            foreach (var key in legacyHashedData.Keys.ToList())
+            {
+                var entry = legacyHashedData[key];
+                entry.DailyCount = 0;
+                entry.LastResetTicks = DateTime.UtcNow.Ticks;
             }
 
             MarkDirtyAndScheduleSave();
@@ -407,6 +433,13 @@ namespace Oxide.Plugins
                     pData.LastResetTicks = DateTime.UtcNow.Ticks;
                     resetCount++;
                 }
+            }
+
+            foreach (var kv in legacyHashedData)
+            {
+                // Legacy anonymized entries without ID mapping are reset blindly until the player reconnects.
+                kv.Value.DailyCount = 0;
+                kv.Value.LastResetTicks = DateTime.UtcNow.Ticks;
             }
 
             MarkDirtyAndScheduleSave();
@@ -536,60 +569,156 @@ namespace Oxide.Plugins
         #region Persistencia
         private void LoadPlayerData()
         {
+            playerData = new Dictionary<string, PlayerRepairData>();
+            legacyHashedData = new Dictionary<string, PlayerRepairData>();
+            bool needsResave = false;
+
             try
             {
-                var loaded = Interface.Oxide.DataFileSystem.ReadObject<Dictionary<string, PlayerRepairData>>("FullDurabilityRepair_Data");
-                if (loaded == null)
+                StoredData container = null;
+
+                try
                 {
-                    playerData = new Dictionary<string, PlayerRepairData>();
+                    container = Interface.Oxide.DataFileSystem.ReadObject<StoredData>(DataFileName);
+                }
+                catch
+                {
+                    container = null;
+                }
+
+                if (container != null && (container.Records?.Count > 0 || container.LegacyHashed?.Count > 0 || container.HashLookup?.Count > 0))
+                {
+                    if (container.Anonymized)
+                    {
+                        if (container.HashLookup != null && container.HashLookup.Count > 0)
+                        {
+                            foreach (var kv in container.Records)
+                            {
+                                if (container.HashLookup.TryGetValue(kv.Key, out var userId) && !string.IsNullOrEmpty(userId))
+                                {
+                                    playerData[userId] = kv.Value;
+                                }
+                                else
+                                {
+                                    legacyHashedData[kv.Key] = kv.Value;
+                                }
+                            }
+                        }
+                        else if (container.Records != null)
+                        {
+                            foreach (var kv in container.Records)
+                            {
+                                legacyHashedData[kv.Key] = kv.Value;
+                            }
+                            needsResave = true;
+                        }
+                    }
+                    else if (container.Records != null)
+                    {
+                        foreach (var kv in container.Records)
+                        {
+                            playerData[kv.Key] = kv.Value;
+                        }
+                    }
+
+                    if (container.LegacyHashed != null && container.LegacyHashed.Count > 0)
+                    {
+                        foreach (var kv in container.LegacyHashed)
+                        {
+                            legacyHashedData[kv.Key] = kv.Value;
+                        }
+                    }
+
+                    if (container.Anonymized && (container.HashLookup == null || container.HashLookup.Count == 0) && legacyHashedData.Count > 0)
+                    {
+                        PrintWarning(lang.GetMessage("AnonymizedDataWarning", this));
+                    }
+
+                    if (needsResave)
+                        MarkDirtyAndScheduleSave();
+
                     return;
                 }
 
-                bool keysLookHashed = loaded.Keys.All(k => k != null && k.Length == 64 && k.All(c => Uri.IsHexDigit(c)));
-
-                if (keysLookHashed && config.AnonymizeIds)
+                var legacy = Interface.Oxide.DataFileSystem.ReadObject<Dictionary<string, PlayerRepairData>>(DataFileName);
+                if (legacy == null || legacy.Count == 0)
                 {
+                    return;
+                }
+
+                bool keysLookHashed = legacy.Keys.All(IsLikelyHash);
+                if (keysLookHashed)
+                {
+                    legacyHashedData = new Dictionary<string, PlayerRepairData>(legacy);
                     PrintWarning(lang.GetMessage("AnonymizedDataWarning", this));
-                    playerData = new Dictionary<string, PlayerRepairData>();
-                    return;
-                }
-                else if (keysLookHashed && !config.AnonymizeIds)
-                {
-                    PrintWarning(lang.GetMessage("AnonymizedDataMismatch", this));
-                    playerData = new Dictionary<string, PlayerRepairData>();
-                    return;
+                    needsResave = true;
                 }
                 else
                 {
-                    playerData = loaded;
+                    playerData = new Dictionary<string, PlayerRepairData>(legacy);
+                    needsResave = true;
                 }
             }
             catch (Exception ex)
             {
                 PrintError($"Error leyendo FullDurabilityRepair_Data: {ex.Message}. Se inicializarán datos vacíos en memoria.");
                 playerData = new Dictionary<string, PlayerRepairData>();
+                legacyHashedData = new Dictionary<string, PlayerRepairData>();
+                return;
             }
+
+            if (needsResave)
+                MarkDirtyAndScheduleSave();
         }
 
-        private void SavePlayerData()
+        private void SavePlayerData(bool force = false)
         {
             try
             {
+                if (!force && !dataDirty)
+                    return;
+
+                var stored = new StoredData();
+
                 if (config != null && config.AnonymizeIds)
                 {
-                    var anon = new Dictionary<string, PlayerRepairData>();
+                    stored.Anonymized = true;
                     foreach (var kv in playerData)
                     {
                         string hashed = HashString(kv.Key);
-                        anon[hashed] = kv.Value;
+                        if (string.IsNullOrEmpty(hashed))
+                            continue;
+
+                        stored.Records[hashed] = kv.Value;
+                        stored.HashLookup[hashed] = kv.Key;
                     }
 
-                    Interface.Oxide.DataFileSystem.WriteObject("FullDurabilityRepair_Data", anon);
+                    if (legacyHashedData.Count > 0)
+                    {
+                        foreach (var kv in legacyHashedData)
+                        {
+                            stored.LegacyHashed[kv.Key] = kv.Value;
+                        }
+                    }
                 }
                 else
                 {
-                    Interface.Oxide.DataFileSystem.WriteObject("FullDurabilityRepair_Data", playerData);
+                    stored.Anonymized = false;
+                    foreach (var kv in playerData)
+                    {
+                        stored.Records[kv.Key] = kv.Value;
+                    }
+
+                    if (legacyHashedData.Count > 0)
+                    {
+                        foreach (var kv in legacyHashedData)
+                        {
+                            stored.LegacyHashed[kv.Key] = kv.Value;
+                        }
+                    }
                 }
+
+                Interface.Oxide.DataFileSystem.WriteObject(DataFileName, stored);
 
                 dataDirty = false;
             }
@@ -620,10 +749,36 @@ namespace Oxide.Plugins
 
         private string FormatSecondsReadable(int seconds)
         {
-            if (seconds < 60) return $"{seconds}s";
-            int mins = seconds / 60;
-            int secs = seconds % 60;
-            return $"{mins:D2}:{secs:D2}";
+            if (seconds < 60)
+                return $"{seconds}s";
+
+            var time = TimeSpan.FromSeconds(seconds);
+
+            if (time.TotalHours < 1)
+            {
+                var partsUnderHour = new List<string> { $"{time.Minutes}m" };
+                if (time.Seconds > 0)
+                    partsUnderHour.Add($"{time.Seconds}s");
+                return string.Join(" ", partsUnderHour);
+            }
+
+            if (time.TotalDays < 1)
+            {
+                var parts = new List<string> { $"{(int)time.TotalHours}h" };
+                if (time.Minutes > 0)
+                    parts.Add($"{time.Minutes}m");
+                if (time.Seconds > 0)
+                    parts.Add($"{time.Seconds}s");
+                return string.Join(" ", parts);
+            }
+
+            var segments = new List<string> { $"{(int)time.TotalDays}d" };
+            if (time.Hours > 0)
+                segments.Add($"{time.Hours}h");
+            if (time.Minutes > 0)
+                segments.Add($"{time.Minutes}m");
+
+            return string.Join(" ", segments);
         }
 
         private string HashString(string input)
@@ -644,6 +799,50 @@ namespace Oxide.Plugins
                 PrintError($"HashString error: {ex.Message}");
                 return input;
             }
+        }
+
+        private PlayerRepairData GetOrCreatePlayerData(string userId, out bool created, out bool migrated)
+        {
+            created = false;
+            var data = FindOrMigratePlayerData(userId, out migrated);
+            if (data != null)
+                return data;
+
+            data = new PlayerRepairData
+            {
+                LastResetTicks = DateTime.UtcNow.Ticks,
+                DailyCount = 0,
+                LastRepairTicks = 0
+            };
+            playerData[userId] = data;
+            created = true;
+            return data;
+        }
+
+        private PlayerRepairData FindOrMigratePlayerData(string userId, out bool migrated)
+        {
+            migrated = false;
+            if (string.IsNullOrEmpty(userId))
+                return null;
+
+            if (playerData.TryGetValue(userId, out var data))
+                return data;
+
+            var hashed = HashString(userId);
+            if (!string.IsNullOrEmpty(hashed) && legacyHashedData.TryGetValue(hashed, out data))
+            {
+                legacyHashedData.Remove(hashed);
+                playerData[userId] = data;
+                migrated = true;
+                return data;
+            }
+
+            return null;
+        }
+
+        private bool IsLikelyHash(string value)
+        {
+            return !string.IsNullOrEmpty(value) && value.Length == 64 && value.All(Uri.IsHexDigit);
         }
 
         private void DestroyTimer(object t)
@@ -704,7 +903,7 @@ namespace Oxide.Plugins
                 {"PeriodicSaveDisabled", "FullDurabilityRepair: periodic save disabled (SaveIntervalSeconds = 0)."},
                 {"WipeDetected", "Wipe detected. Resetting all repair limits..."},
                 {"AutoResetPerformed", "FullDurabilityRepair: daily counters have been reset automatically."},
-                {"AnonymizedDataWarning", "FullDurabilityRepair: data file contains anonymized IDs (hash). Cannot restore to memory."},
+                {"AnonymizedDataWarning", "FullDurabilityRepair: data file contains legacy anonymized IDs. Entries will migrate automatically as players reconnect."},
                 {"AnonymizedDataMismatch", "FullDurabilityRepair: data file contains anonymized IDs but AnonymizeIds is disabled in config. Data will not be loaded."}
             };
 
@@ -747,7 +946,7 @@ namespace Oxide.Plugins
                 {"PeriodicSaveDisabled", "FullDurabilityRepair: guardado periódico desactivado (SaveIntervalSeconds = 0)."},
                 {"WipeDetected", "Se detectó un wipe. Restableciendo todos los límites de reparación..."},
                 {"AutoResetPerformed", "FullDurabilityRepair: los contadores diarios se reiniciaron automáticamente."},
-                {"AnonymizedDataWarning", "FullDurabilityRepair: archivo de datos en disco contiene IDs anonimizados (hash). No es posible restaurar las cuentas a memoria."},
+                {"AnonymizedDataWarning", "FullDurabilityRepair: archivo de datos contiene IDs anonimizados heredados. Se migrarán automáticamente cuando los jugadores vuelvan a usar el plugin."},
                 {"AnonymizedDataMismatch", "FullDurabilityRepair: archivo de datos contiene IDs anonimizados (hash) pero la configuración actual no habilita AnonymizeIds. No se cargarán los datos para evitar inconsistencias."}
             };
 
@@ -790,7 +989,7 @@ namespace Oxide.Plugins
                 {"PeriodicSaveDisabled", "FullDurabilityRepair: salvamento periódico desativado (SaveIntervalSeconds = 0)."},
                 {"WipeDetected", "Wipe detectado. Reiniciando todos os limites de reparo..."},
                 {"AutoResetPerformed", "FullDurabilityRepair: contadores diários foram reiniciados automaticamente."},
-                {"AnonymizedDataWarning", "FullDurabilityRepair: arquivo de dados contém IDs anonimizados (hash). Não é possível restaurar para memória."},
+                {"AnonymizedDataWarning", "FullDurabilityRepair: arquivo de dados contém IDs anonimizados legados. As entradas serão migradas automaticamente quando os jogadores retornarem."},
                 {"AnonymizedDataMismatch", "FullDurabilityRepair: arquivo de dados contém IDs anonimizados, mas AnonymizeIds está desativado na configuração. Os dados não serão carregados."}
             };
 
